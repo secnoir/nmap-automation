@@ -1,0 +1,244 @@
+import argparse
+import csv
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+
+
+try:
+    import nmap
+    HAS_PY_NMAP = True
+except Exception:
+    HAS_PY_NMAP = False
+
+LOCK = threading.Lock()
+DEFAULT_THREADS = 6
+BANNER_TIMEOUT = 2.0
+
+
+def safe_print(*a, **k):
+    with LOCK:
+        print(*a, **k)
+
+
+
+
+def load_targets(file_or_list):
+    if isinstance(file_or_list, list):
+        return file_or_list
+    path = Path(file_or_list)
+    if not path.exists():
+        return []
+    out = []
+    for l in path.read_text().splitlines():
+        l = l.strip()
+        if not l or l.startswith("#"):
+            continue
+        out.append(l)
+    return out
+
+
+def run_nmap_pynmap(target, ports, args):
+    nm = nmap.PortScanner()
+    nm.scan(hosts=target, arguments=f"-p {ports} {args}".strip())
+    return nm
+
+
+def run_nmap_cli_xml(target, ports, args):
+    cmd = ["nmap", "-p", str(ports), "-oX", "-", *args.split(), target]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return p.stdout
+    except subprocess.CalledProcessError as e:
+        return None
+
+def parse_nmap_xml(xml_text, target):
+    if not xml_text:
+        return {"host": target, "state": "error", "error": "no_xml"}
+    root = ET.fromstring(xml_text)
+    host_elem = root.find("host")
+    if host_elem is None:
+        return {"host": target, "state": "unknown"}
+    res = {"host": target, "addresses": {}, "tcp": {}}
+    status = host_elem.find("status")
+    if status is not None:
+        res["state"] = status.get("state")
+    for addr in host_elem.findall("address"):
+        res["addresses"][addr.get("addrtype")] = addr.get("addr")
+    ports_elem = host_elem.find("ports")
+    if ports_elem is not None:
+        for p in ports_elem.findall("port"):
+            pid = int(p.get("portid"))
+            state_elem = p.find("state")
+            s = state_elem.get("state") if state_elem is not None else None
+            svc = p.find("service")
+            svcname = svc.get("name") if svc is not None else None
+            product = svc.get("product") if svc is not None and "product" in svc.attrib else None
+            version = svc.get("version") if svc is not None and "version" in svc.attrib else None
+            res["tcp"][pid] = {"state": s, "service": svcname, "product": product, "version": version}
+    return res                                                                                                                                                                  
+
+
+def grab_banner(ip, port, timeout=BANNER_TIMEOUT):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            # try a tiny probe for common text services (HTTP HEAD)
+            try:
+                s.send(b"HEAD / HTTP/1.0\r\n\r\n")
+            except Exception:
+                pass
+            try:
+                data = s.recv(4096)
+                return data.decode("utf-8", errors="replace").strip()
+            except Exception:
+                return ""
+    except Exception:
+        return ""
+
+
+
+def scan_target(target, ports, nmap_args, do_banners):
+    try:
+        if HAS_PY_NMAP:
+            nm = run_nmap_pynmap(target, ports, nmap_args)
+            res = {"host": target, "addresses": {}, "tcp": {}}
+            if target in nm.all_hosts():
+                h = nm[target]
+                res["state"] = h.state()
+                res["addresses"] = h.addresses()
+                for p in sorted(h.get("tcp", {}) or []):
+                    info = h["tcp"][p]
+                    res["tcp"][p] = {
+                        "state": info.get("state"),
+                        "service": info.get("name"),
+                        "product": info.get("product"),
+                        "version": info.get("version"),
+                    }
+            else:
+                res["state"] = "down_or_filtered"
+        else:
+            xml = run_nmap_cli_xml(target, ports, nmap_args)
+            res = parse_nmap_xml(xml, target)
+ 
+        # banner grabbing
+        ip = None
+        addrs = res.get("addresses") or {}
+        if isinstance(addrs, dict):
+            ip = next(iter(addrs.values()), None)
+        if do_banners and ip and res.get("tcp"):
+            for p, info in list(res["tcp"].items()):
+                if info.get("state", "").startswith("open"):
+                    info["banner"] = grab_banner(ip, int(p))
+
+        return res
+    except Exception as e:
+        return {"host": target, "state": "error", "error": str(e)}
+
+
+def save_json(results, path):
+    with open(path, "w") as f:
+        json.dump(results, f, indent=2)
+
+
+def save_csv(results, path):
+    rows = []
+    for r in results:
+        host = r.get("host")
+        addrs = r.get("addresses") or {}
+        ip = next(iter(addrs.values()), "") if isinstance(addrs, dict) else ""
+        tcp = r.get("tcp", {})
+        if tcp:
+            for port, info in tcp.items():
+                rows.append({
+                    "host": host,
+                    "ip": ip,
+                    "port": port,
+                    "state": info.get("state"),
+                    "service": info.get("service"),
+                    "product": info.get("product"),
+                    "version": info.get("version"),
+                    "banner": info.get("banner", ""),
+                })
+        else:
+            rows.append({"host": host, "ip": ip, "port": "", "state": r.get("state"), "service": "", "product": "", "version": "", "banner": ""})
+    keys = ["host", "ip", "port", "state", "service", "product", "version", "banner"]
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=keys)
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+
+
+
+def main():
+    p = argparse.ArgumentParser(description="nmap_mini — compact nmap automation (authorized testing only)")
+    grp = p.add_mutually_exclusive_group(required=True)
+    grp.add_argument("-t", "--target", help="single target (ip or host)")
+    grp.add_argument("-f", "--file", help="file with targets, one per line")
+    p.add_argument("-p", "--ports", default="1-1024", help="ports or ranges (default 1-1024)")
+    p.add_argument("-T", "--threads", type=int, default=DEFAULT_THREADS, help="concurrent threads")
+    p.add_argument("--banners", action="store_true", help="grab simple banners from open ports")
+    p.add_argument("-o", "--outdir", default="nmap_mini_out", help="output folder")
+    p.add_argument("--extra", "-e", default="-sS -sV --open", help="extra nmap args (default: -sS -sV --open)")
+    # safety
+    p.add_argument("--confirm", required=True, help='Type exactly "I HAVE AUTH" to proceed')
+    p.add_argument("--whitelist", help="optional file with allowed targets (one per line)")
+
+    args = p.parse_args()
+
+    if args.confirm != "I HAVE AUTH":
+        safe_print("Refusing to run: confirmation token did not match.")
+        sys.exit(1)
+
+    targets = [args.target] if args.target else load_targets(args.file)
+    if not targets:
+        safe_print("No targets found.")
+        sys.exit(1)
+
+    if args.whitelist:
+        allowed = set(load_targets(args.whitelist))
+        bad = [t for t in targets if t not in allowed]
+        if bad:
+            safe_print("Refusing to scan targets not in whitelist:", bad)
+            targets = [t for t in targets if t in allowed]
+        if not targets:
+            safe_print("No allowed targets left after whitelist filtering.")
+            sys.exit(1)
+
+    os.makedirs(args.outdir, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    json_path = Path(args.outdir) / f"results_{ts}.json"
+    csv_path = Path(args.outdir) / f"results_{ts}.csv"
+
+    safe_print(f"Scanning {len(targets)} target(s) | ports={args.ports} | threads={args.threads} | banners={args.banners}")
+    results = []
+    with ThreadPoolExecutor(max_workers=args.threads) as exe:
+        futs = {exe.submit(scan_target, t, args.ports, args.extra, args.banners): t for t in targets}
+        for fut in as_completed(futs):
+            t = futs[fut]
+            try:
+                r = fut.result()
+                results.append(r)
+                open_ports = [str(p) for p,info in (r.get("tcp") or {}).items() if info.get("state","").startswith("open")]
+                safe_print(f"[{t}] {r.get('state','?')} | open: {','.join(open_ports) if open_ports else '-'}")
+            except Exception as e:
+                safe_print(f"[!] {t} error: {e}")
+
+    save_json(results, json_path)
+    save_csv(results, csv_path)
+    safe_print(f"Saved JSON -> {json_path}")
+    safe_print(f"Saved CSV  -> {csv_path}")
+    safe_print("Done.")
+
+
+if __name__ == "__main__":
+    main()
