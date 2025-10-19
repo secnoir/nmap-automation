@@ -8,3 +8,7 @@ Runs an Nmap scan (via python-nmap) against a single host and ports.
 Prints each found port with protocol, state and service name.
 
 Writes results to scan_<timestamp>.csv.
+
+
+# nmap_mini
+nmap_mini is a lightweight recon script that runs nmap (via python-nmap or the CLI), parses XML output into structured JSON, performs optional banner grabs, and writes results to JSON and CSV. Designed for multithreaded runs and easy integration into pipelines — must be used only with explicit authorization.
